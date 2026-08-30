@@ -94,6 +94,7 @@ class OnnxController:
     self._action_scale = action_scale
     self._default_angles = default_angles
     self._last_action = np.zeros_like(default_angles, dtype=np.float32)
+    self._obs_last_action = self._last_action.copy()
 
     self._counter = 0
     self._n_substeps = n_substeps
@@ -125,6 +126,10 @@ class OnnxController:
     # Kept so the optional telemetry exporter can report the operator intent the
     # policy actually saw, instead of re-polling the pad a step later.
     self._last_command = command
+    # Likewise for the action term: `_last_action` is overwritten with this
+    # step's prediction before telemetry runs, so the value the policy was
+    # conditioned on is kept separately.
+    self._obs_last_action = np.array(self._last_action, dtype=np.float32)
     obs = np.hstack([
         linvel,
         gyro,

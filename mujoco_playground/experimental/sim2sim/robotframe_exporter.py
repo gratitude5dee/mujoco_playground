@@ -143,6 +143,8 @@ class ThreadedSink:
         target=self._drain, name="robotframe-telemetry", daemon=True
     )
     self.dropped = 0
+    # Set when `close` gives up on a worker stuck in a blocking write.
+    self.abandoned = False
     self._worker.start()
 
   @property
@@ -185,6 +187,14 @@ class ThreadedSink:
       except (queue.Empty, queue.Full):
         pass
     self._worker.join(timeout=2.0)
+    if self._worker.is_alive():
+      # The worker is still inside a blocking write, and the sink's own `close`
+      # would queue behind it — a full stdout pipe has no timeout to fall back
+      # on. The worker is a daemon, so leaving it where it is costs a possibly
+      # unflushed final frame and nothing else; hanging the rollout's shutdown
+      # would cost more.
+      self.abandoned = True
+      return
     self._sink.close()
 
 
@@ -521,10 +531,14 @@ class RobotFrameExporter:
       if command is not None:
         # (forward, lateral, yaw-rate) as the operator asked for it.
         block["command"] = _round_list(np.atleast_1d(command))
-      last_action = getattr(controller, "_last_action", None)
+      # The action term of the observation is the *previous* action, and
+      # `_last_action` already holds this step's prediction by the time
+      # telemetry runs — so `_obs_last_action`, snapshotted inside `get_obs`, is
+      # what makes a recorded frame reproducible.
+      last_action = getattr(controller, "_obs_last_action", None)
+      if last_action is None:
+        last_action = getattr(controller, "_last_action", None)
       if last_action is not None:
-        # The previous action is part of the observation vector, so a recorded
-        # frame is only reproducible with it.
         block["lastAction"] = _round_list(np.atleast_1d(last_action))
     return block
 
