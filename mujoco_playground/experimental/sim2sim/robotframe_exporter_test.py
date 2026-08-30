@@ -16,6 +16,9 @@
 
 import json
 import math
+import pathlib
+import subprocess
+import sys
 import threading
 import time
 
@@ -465,6 +468,41 @@ class ThreadedSinkTest(absltest.TestCase):
     sink.write_line('{"n":1}')
     sink.close()
     self.assertEqual(sink.dropped, 1)
+
+  def test_a_blocked_stdout_pipe_does_not_hang_interpreter_exit(self):
+    # The child fills its (never-drained) stdout pipe from the worker thread,
+    # closes the sink, and exits. It must terminate within the bound: a worker
+    # parked inside a buffered `sys.stdout.write` would hold the stream lock
+    # that interpreter finalization needs to flush stdout, deadlocking exit —
+    # the fd-level writes in StdoutSink hold no Python lock.
+    # The module is loaded by file path so the child skips the package's heavy
+    # imports and the test times the shutdown, not the import.
+    module_path = (
+        pathlib.Path(__file__).resolve().parent / "robotframe_exporter.py"
+    )
+    child = (
+        "import importlib.util, sys, time;"
+        "spec = importlib.util.spec_from_file_location('r', %r);"
+        "r = importlib.util.module_from_spec(spec);"
+        "spec.loader.exec_module(r);"
+        "s = r.open_sink('stdout');"
+        "[s.write_line('x' * 65536) for _ in range(64)];"
+        "time.sleep(0.5);"
+        "s.close(); sys.exit(0)"
+    ) % (str(module_path),)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child],
+        stdout=subprocess.PIPE,  # never read: the pipe fills and stays full
+        stderr=subprocess.PIPE,
+    )
+    try:
+      proc.wait(timeout=30.0)
+    except subprocess.TimeoutExpired:
+      proc.kill()
+      self.fail("shutdown hung with a blocked stdout pipe")
+    finally:
+      proc.stdout.close()
+      proc.stderr.close()
 
   def test_open_sink_wraps_blocking_sinks_by_default(self):
     threaded = robotframe_exporter.open_sink("stdout")
