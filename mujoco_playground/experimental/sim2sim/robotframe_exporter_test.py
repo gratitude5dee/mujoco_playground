@@ -70,10 +70,18 @@ class _FakeController:
     self._phase = np.array([phase, phase + np.pi])
     self._default_angles = np.arange(n_joints, dtype=float) * 0.1
     self._last_action = np.full(n_joints, -0.25)
+    self._obs_last_action = self._last_action.copy()
     self._last_command = np.zeros(3)
+
+  def act(self, action):
+    """Mimic the prediction step, which overwrites `_last_action`."""
+    self._last_action = np.asarray(action, dtype=float)
 
   def get_obs(self, model, data):
     del model
+    # As in OnnxController: the action term of the observation is snapshotted
+    # here, before the prediction replaces `_last_action`.
+    self._obs_last_action = np.array(self._last_action, dtype=float)
     joint_angles = data.qpos[7:] - self._default_angles
     joint_velocities = data.qvel[6:]
     phase = np.concatenate([np.cos(self._phase), np.sin(self._phase)])
@@ -81,7 +89,7 @@ class _FakeController:
         self._last_command,
         joint_angles,
         joint_velocities,
-        self._last_action,
+        self._obs_last_action,
         phase,
     ]).astype(np.float32)
 
@@ -345,6 +353,23 @@ class ObsBlockTest(absltest.TestCase):
         atol=1e-4,
     )
 
+  def test_last_action_is_the_one_the_observation_carried(self):
+    model, data = _jointed_state()
+    controller = _FakeController(0.25, n_joints=2)
+    exporter = robotframe_exporter.RobotFrameExporter(
+        _RecordingSink(), rate_hz=0.0, include_obs=True
+    )
+    # Two consecutive inferences: the frame published after the second one must
+    # report the action fed to it, not the prediction it produced.
+    controller.act([0.1, 0.2])
+    controller.get_obs(model, data)
+    controller.act([0.9, -0.9])
+    obs = controller.get_obs(model, data)
+    controller.act([-0.4, 0.4])
+    block = exporter.frame_from_state(model, data, controller)["sim"]
+    np.testing.assert_allclose(block["lastAction"], obs[7:9], atol=1e-4)
+    np.testing.assert_allclose(block["lastAction"], [0.9, -0.9], atol=1e-4)
+
 
 class PublishTest(absltest.TestCase):
 
@@ -400,6 +425,32 @@ class ThreadedSinkTest(absltest.TestCase):
     sink.close()
     self.assertTrue(stalled.closed)
     self.assertLessEqual(len(stalled.lines), 3)
+
+  def test_close_gives_up_on_a_still_stalled_worker(self):
+    release = threading.Event()
+
+    class _NeverReleasedSink(_RecordingSink):
+
+      def write_line(self, line):
+        release.wait(30.0)
+        super().write_line(line)
+
+      def close(self):
+        release.wait(30.0)
+        super().close()
+
+    stalled = _NeverReleasedSink()
+    sink = robotframe_exporter.ThreadedSink(stalled, max_queued=2)
+    sink.write_line('{"n":1}')
+    started = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - started
+    # `close` may wait out its bounded join, but it must not then queue behind
+    # the stuck worker on the sink's own close.
+    self.assertLess(elapsed, 5.0)
+    self.assertTrue(sink.abandoned)
+    self.assertFalse(stalled.closed)
+    release.set()
 
   def test_frames_reach_the_wrapped_sink_and_close_joins(self):
     recording = _RecordingSink()
