@@ -16,6 +16,8 @@
 
 import json
 import math
+import threading
+import time
 
 from absl.testing import absltest
 import mujoco
@@ -57,10 +59,31 @@ class _BrokenSink(_RecordingSink):
 
 
 class _FakeController:
-  """Stands in for OnnxController: only its gait clock is read."""
+  """Stands in for OnnxController.
 
-  def __init__(self, phase):
+  Carries the same private attributes the real controller exposes and builds its
+  observation the same way, so a test can compare what the exporter serializes
+  against the slices the policy is actually fed.
+  """
+
+  def __init__(self, phase, n_joints=0):
     self._phase = np.array([phase, phase + np.pi])
+    self._default_angles = np.arange(n_joints, dtype=float) * 0.1
+    self._last_action = np.full(n_joints, -0.25)
+    self._last_command = np.zeros(3)
+
+  def get_obs(self, model, data):
+    del model
+    joint_angles = data.qpos[7:] - self._default_angles
+    joint_velocities = data.qvel[6:]
+    phase = np.concatenate([np.cos(self._phase), np.sin(self._phase)])
+    return np.hstack([
+        self._last_command,
+        joint_angles,
+        joint_velocities,
+        self._last_action,
+        phase,
+    ]).astype(np.float32)
 
 
 def _state(
@@ -71,6 +94,39 @@ def _state(
   data.qpos[0:3] = pos
   data.qpos[3:7] = quat
   data.qvel[0:3] = vel
+  mujoco.mj_forward(model, data)
+  return model, data
+
+
+# Two hinges past the free joint, so qpos[7:] / qvel[6:] are non-empty and the
+# serialized observation can be checked against real slices.
+_JOINTED_XML = """
+<mujoco>
+  <worldbody>
+    <body name="pelvis" pos="0 0 0.75">
+      <freejoint/>
+      <geom type="sphere" size="0.1"/>
+      <body name="thigh" pos="0 0 -0.2">
+        <joint name="hip" type="hinge" axis="0 1 0"/>
+        <geom type="capsule" fromto="0 0 0 0 0 -0.2" size="0.04"/>
+        <body name="shank" pos="0 0 -0.2">
+          <joint name="knee" type="hinge" axis="0 1 0"/>
+          <geom type="capsule" fromto="0 0 0 0 0 -0.2" size="0.04"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+
+def _jointed_state(joint_angles=(0.3, -0.7), joint_vels=(0.1, -0.2)):
+  model = mujoco.MjModel.from_xml_string(_JOINTED_XML)
+  data = mujoco.MjData(model)
+  data.qpos[0:3] = (0.0, 0.0, 0.75)
+  data.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
+  data.qpos[7:] = joint_angles
+  data.qvel[6:] = joint_vels
   mujoco.mj_forward(model, data)
   return model, data
 
@@ -267,6 +323,28 @@ class ObsBlockTest(absltest.TestCase):
     self.assertNotIn("gravityPelvis", block)
     self.assertIsInstance(json.loads(json.dumps(block)), dict)
 
+  def test_the_serialized_observation_matches_the_policy_input_slices(self):
+    model, data = _jointed_state()
+    controller = _FakeController(0.25, n_joints=2)
+    controller._last_command = np.array([0.5, -0.25, 1.0])
+    block = robotframe_exporter.RobotFrameExporter(
+        _RecordingSink(), rate_hz=0.0, include_obs=True
+    ).frame_from_state(model, data, controller)["sim"]
+    obs = controller.get_obs(model, data)
+    # Layout of the fake's (and the real controller's) trailing observation:
+    # command(3) | joint angles(2) | joint velocities(2) | last action(2).
+    np.testing.assert_allclose(block["command"], obs[0:3], atol=1e-4)
+    np.testing.assert_allclose(block["jointAnglesRad"], obs[3:5], atol=1e-4)
+    np.testing.assert_allclose(block["jointVelRadps"], obs[5:7], atol=1e-4)
+    np.testing.assert_allclose(block["lastAction"], obs[7:9], atol=1e-4)
+    # Absolute angles remain recoverable from the offsets that were sent.
+    np.testing.assert_allclose(
+        np.asarray(block["jointAnglesRad"])
+        + np.asarray(block["defaultAnglesRad"]),
+        data.qpos[7:],
+        atol=1e-4,
+    )
+
 
 class PublishTest(absltest.TestCase):
 
@@ -297,6 +375,53 @@ class PublishTest(absltest.TestCase):
     self.assertTrue(sink.closed)
 
 
+class ThreadedSinkTest(absltest.TestCase):
+
+  def test_a_slow_sink_does_not_block_the_caller(self):
+    release = threading.Event()
+
+    class _StalledSink(_RecordingSink):
+
+      def write_line(self, line):
+        release.wait(5.0)
+        super().write_line(line)
+
+    stalled = _StalledSink()
+    sink = robotframe_exporter.ThreadedSink(stalled, max_queued=2)
+    started = time.monotonic()
+    for index in range(50):
+      sink.write_line(f'{{"n":{index}}}')
+    elapsed = time.monotonic() - started
+    # The worker is parked inside the first write for seconds; the control
+    # thread must not have waited on it.
+    self.assertLess(elapsed, 1.0)
+    self.assertGreater(sink.dropped, 0, "backpressure drops the oldest frames")
+    release.set()
+    sink.close()
+    self.assertTrue(stalled.closed)
+    self.assertLessEqual(len(stalled.lines), 3)
+
+  def test_frames_reach_the_wrapped_sink_and_close_joins(self):
+    recording = _RecordingSink()
+    sink = robotframe_exporter.ThreadedSink(recording)
+    sink.write_line('{"n":1}')
+    sink.close()
+    self.assertEqual(recording.lines, ['{"n":1}'])
+    self.assertTrue(recording.closed)
+
+  def test_a_failing_write_is_counted_not_raised(self):
+    sink = robotframe_exporter.ThreadedSink(_BrokenSink())
+    sink.write_line('{"n":1}')
+    sink.close()
+    self.assertEqual(sink.dropped, 1)
+
+  def test_open_sink_wraps_blocking_sinks_by_default(self):
+    threaded = robotframe_exporter.open_sink("stdout")
+    self.assertIsInstance(threaded, robotframe_exporter.ThreadedSink)
+    self.assertIsInstance(threaded.sink, robotframe_exporter.StdoutSink)
+    threaded.close()
+
+
 class MakeExporterTest(absltest.TestCase):
 
   def test_telemetry_is_off_by_default(self):
@@ -314,18 +439,27 @@ class MakeExporterTest(absltest.TestCase):
 
   def test_sink_selection(self):
     self.assertIsInstance(
-        robotframe_exporter.open_sink("stdout"), robotframe_exporter.StdoutSink
+        robotframe_exporter.open_sink("stdout", threaded=False),
+        robotframe_exporter.StdoutSink,
     )
     self.assertIsInstance(
-        robotframe_exporter.open_sink("/tmp/gev-g1.sock"),
+        robotframe_exporter.open_sink("/tmp/gev-g1.sock", threaded=False),
         robotframe_exporter.SocketSink,
     )
     self.assertIsInstance(
-        robotframe_exporter.open_sink("127.0.0.1:8765"),
+        robotframe_exporter.open_sink("127.0.0.1:8765", threaded=False),
         robotframe_exporter.SocketSink,
     )
     with self.assertRaises(ValueError):
       robotframe_exporter.open_sink("")
+
+  def test_an_out_of_range_tcp_port_is_rejected_at_startup(self):
+    for target in ("localhost:99999", "127.0.0.1:0", "host:65536"):
+      with self.assertRaises(ValueError):
+        robotframe_exporter.open_sink(target)
+    family, address = robotframe_exporter.parse_socket_target("localhost:8765")
+    self.assertEqual(address, ("localhost", 8765))
+    del family
 
   def test_a_socket_sink_without_a_listener_drops_instead_of_raising(self):
     sink = robotframe_exporter.SocketSink("/tmp/gev-g1-nonexistent.sock")

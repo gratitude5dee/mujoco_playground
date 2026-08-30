@@ -145,12 +145,14 @@ class OnnxController:
       onnx_pred = self._policy.run(self._output_names, onnx_input)[0][0]
       self._last_action = onnx_pred.copy()
       data.ctrl[:] = onnx_pred * self._action_scale + self._default_angles
-      phase_tp1 = self._phase + self._phase_dt
-      self._phase = np.fmod(phase_tp1 + np.pi, 2 * np.pi) - np.pi
+      # Published before the clock advances, so the reported phase is the one
+      # this step's action was computed from.
       if self._exporter is not None:
         self._exporter.publish(
             self._exporter.frame_from_state(model, data, self)
         )
+      phase_tp1 = self._phase + self._phase_dt
+      self._phase = np.fmod(phase_tp1 + np.pi, 2 * np.pi) - np.pi
 
 
 def load_callback(model=None, data=None, exporter=None):

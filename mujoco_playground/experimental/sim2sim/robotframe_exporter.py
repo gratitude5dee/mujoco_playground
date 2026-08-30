@@ -46,9 +46,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import queue
 import re
 import socket
 import sys
+import threading
 import time
 from typing import Any, Optional, Protocol, Sequence
 
@@ -101,6 +103,91 @@ class StdoutSink:
     sys.stdout.flush()
 
 
+MAX_PORT = 65535
+
+
+def parse_socket_target(target: str) -> tuple[int, Any]:
+  """Resolve a `--telemetry` socket spec to an (address family, address) pair.
+
+  A numeric suffix means TCP, and it is range-checked here rather than left to
+  `socket.connect`, which raises `OverflowError` — not `OSError` — on a port
+  outside 0..65535 and so would escape the exporter's failure containment.
+  """
+  host, _, port = target.rpartition(":")
+  if port.isdigit():
+    port_number = int(port)
+    if not 1 <= port_number <= MAX_PORT:
+      raise ValueError(
+          f"telemetry TCP port must be 1..{MAX_PORT}, received {target!r}"
+      )
+    return socket.AF_INET, ((host or "127.0.0.1"), port_number)
+  return socket.AF_UNIX, target
+
+
+class ThreadedSink:
+  """Runs a blocking sink on a worker thread behind a bounded queue.
+
+  Writes are issued from `mjcb_control`, where a stalled consumer — an unread
+  pipe, a socket whose window is full, a TCP connect that has to time out —
+  would hold up the physics step itself. The control thread therefore only ever
+  does a non-blocking `put`, and the *telemetry* is what degrades under
+  backpressure: the oldest queued frame is discarded to make room for the
+  newest, because a map consumer wants the latest pose, not a replay of a
+  backlog.
+  """
+
+  def __init__(self, sink: Sink, max_queued: int = 8):
+    self._sink = sink
+    self._queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=max_queued)
+    self._worker = threading.Thread(
+        target=self._drain, name="robotframe-telemetry", daemon=True
+    )
+    self.dropped = 0
+    self._worker.start()
+
+  @property
+  def sink(self) -> Sink:
+    """The wrapped blocking sink, for status reporting and tests."""
+    return self._sink
+
+  def _drain(self) -> None:
+    while True:
+      line = self._queue.get()
+      if line is None:
+        return
+      try:
+        self._sink.write_line(line)
+      except (OSError, ValueError):
+        self.dropped += 1
+
+  def write_line(self, line: str) -> None:
+    while True:
+      try:
+        self._queue.put_nowait(line)
+        return
+      except queue.Full:
+        try:
+          self._queue.get_nowait()
+          self.dropped += 1
+        except queue.Empty:
+          # The worker drained it between the two calls; retry the put.
+          continue
+
+  def close(self) -> None:
+    try:
+      self._queue.put_nowait(None)
+    except queue.Full:
+      # Make room for the sentinel; a queued frame at shutdown is worth less
+      # than a clean join.
+      try:
+        self._queue.get_nowait()
+        self._queue.put_nowait(None)
+      except (queue.Empty, queue.Full):
+        pass
+    self._worker.join(timeout=2.0)
+    self._sink.close()
+
+
 class SocketSink:
   """JSON Lines to a listening local socket, reconnecting when it drops.
 
@@ -110,6 +197,9 @@ class SocketSink:
   """
 
   def __init__(self, target: str, reconnect_interval_s: float = 1.0):
+    # Validated eagerly so a malformed target fails at startup rather than once
+    # per frame inside the control callback.
+    parse_socket_target(target)
     self._target = target
     self._reconnect_interval_s = reconnect_interval_s
     self._socket: Optional[socket.socket] = None
@@ -117,10 +207,7 @@ class SocketSink:
     self.dropped = 0
 
   def _address(self) -> tuple[int, Any]:
-    host, _, port = self._target.rpartition(":")
-    if port.isdigit():
-      return socket.AF_INET, ((host or "127.0.0.1"), int(port))
-    return socket.AF_UNIX, self._target
+    return parse_socket_target(self._target)
 
   def _connect(self) -> None:
     now = time.monotonic()
@@ -158,13 +245,16 @@ class SocketSink:
         self._socket = None
 
 
-def open_sink(spec: str) -> Sink:
-  """Build a sink from a `--telemetry` value."""
-  if spec == "stdout":
-    return StdoutSink()
+def open_sink(spec: str, threaded: bool = True) -> Sink:
+  """Build a sink from a `--telemetry` value.
+
+  Wrapped in a `ThreadedSink` by default so no write can block the control
+  callback; pass `threaded=False` for synchronous behaviour in tests.
+  """
   if not spec:
     raise ValueError("empty telemetry target")
-  return SocketSink(spec)
+  sink: Sink = StdoutSink() if spec == "stdout" else SocketSink(spec)
+  return ThreadedSink(sink) if threaded else sink
 
 
 def _round_list(values: Any, digits: int = 4) -> list[float]:
@@ -401,10 +491,19 @@ class RobotFrameExporter:
     bridge strips this block before forwarding. Turn it on when recording a
     rollout or debugging a policy against the map, not for a live map feed.
     """
-    block: dict[str, Any] = {
-        "jointAnglesRad": _round_list(data.qpos[7:]),
-        "jointVelRadps": _round_list(data.qvel[6:]),
-    }
+    block: dict[str, Any] = {"jointVelRadps": _round_list(data.qvel[6:])}
+    # The network is fed joint angles *relative to the default pose*, so that is
+    # what is serialized; the absolute angles are recoverable by adding the
+    # controller's default angles back, which are constant for a rollout.
+    default_angles = getattr(controller, "_default_angles", None)
+    if default_angles is not None:
+      block["jointAnglesRad"] = _round_list(
+          np.asarray(data.qpos[7:], dtype=float)
+          - np.asarray(default_angles, dtype=float)
+      )
+      block["defaultAnglesRad"] = _round_list(default_angles)
+    else:
+      block["jointAnglesRad"] = _round_list(data.qpos[7:])
     linvel = _sensor(data, "local_linvel_pelvis")
     if linvel is not None:
       block["linvelPelvis"] = _round_list(linvel)
@@ -422,6 +521,11 @@ class RobotFrameExporter:
       if command is not None:
         # (forward, lateral, yaw-rate) as the operator asked for it.
         block["command"] = _round_list(np.atleast_1d(command))
+      last_action = getattr(controller, "_last_action", None)
+      if last_action is not None:
+        # The previous action is part of the observation vector, so a recorded
+        # frame is only reproducible with it.
+        block["lastAction"] = _round_list(np.atleast_1d(last_action))
     return block
 
   def publish(self, frame: dict[str, Any]) -> bool:
