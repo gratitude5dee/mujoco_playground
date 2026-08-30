@@ -46,6 +46,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import os
 import queue
 import re
 import socket
@@ -93,14 +94,26 @@ class Sink(Protocol):
 
 
 class StdoutSink:
-  """JSON Lines on stdout, for `… | node tools/robot-bridge/bridge.mjs`."""
+  """JSON Lines on stdout, for `… | node tools/robot-bridge/bridge.mjs`.
+
+  Writes go straight to the file descriptor rather than through `sys.stdout`.
+  The buffered stream's write takes an interpreter-wide lock that finalization
+  also needs to flush stdout — so a worker thread parked on a full pipe inside
+  `sys.stdout.write` would deadlock interpreter exit. A thread parked inside
+  `os.write` holds no Python lock and, as a daemon, is simply left behind.
+  """
+
+  def __init__(self) -> None:
+    self._fd = sys.stdout.fileno()
 
   def write_line(self, line: str) -> None:
-    sys.stdout.write(line + "\n")
-    sys.stdout.flush()
+    payload = (line + "\n").encode("utf-8")
+    while payload:
+      written = os.write(self._fd, payload)
+      payload = payload[written:]
 
   def close(self) -> None:
-    sys.stdout.flush()
+    pass
 
 
 MAX_PORT = 65535
